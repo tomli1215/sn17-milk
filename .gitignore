@@ -1,0 +1,16 @@
+.venv/
+.venv-vllm/
+.cache/
+__pycache__/
+generated_outputs/
+input_data/
+.idea/
+.vscode/
+images/
+*.pyc
+.env
+build/
+third_party/
+o_voxel.egg-info/
+generated_outputs_*/
+
