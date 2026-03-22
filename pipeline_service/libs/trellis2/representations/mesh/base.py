@@ -1,7 +1,9 @@
 from typing import *
+import warnings
 import torch
 from ..voxel import Voxel
 import cumesh
+from libs.cumesh_skippable_errors import skippable_cumesh_fill_holes_error
 from flex_gemm.ops.grid_sample import grid_sample_3d
 
 
@@ -35,24 +37,34 @@ class Mesh:
     def fill_holes(self, max_hole_perimeter=3e-2):
         vertices = self.vertices.cuda()
         faces = self.faces.cuda()
-        
+
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)
-        mesh.get_edges()
-        mesh.get_boundary_info()
-        if mesh.num_boundaries == 0:
+        try:
+            mesh.get_edges()
+            mesh.get_boundary_info()
+            if mesh.num_boundaries == 0:
+                return
+            mesh.get_vertex_edge_adjacency()
+            mesh.get_vertex_boundary_adjacency()
+            mesh.get_manifold_boundary_adjacency()
+            mesh.read_manifold_boundary_adjacency()
+            mesh.get_boundary_connected_components()
+            mesh.get_boundary_loops()
+            if mesh.num_boundary_loops == 0:
+                return
+            mesh.fill_holes(max_hole_perimeter=max_hole_perimeter)
+            new_vertices, new_faces = mesh.read()
+        except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, RuntimeError, MemoryError) as e:
+            if not skippable_cumesh_fill_holes_error(e):
+                raise
+            warnings.warn(
+                f"fill_holes skipped ({self.faces.shape[0]} faces): {e}"
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return
-        mesh.get_vertex_edge_adjacency()
-        mesh.get_vertex_boundary_adjacency()
-        mesh.get_manifold_boundary_adjacency()
-        mesh.read_manifold_boundary_adjacency()
-        mesh.get_boundary_connected_components()
-        mesh.get_boundary_loops()
-        if mesh.num_boundary_loops == 0:
-            return
-        mesh.fill_holes(max_hole_perimeter=max_hole_perimeter)
-        new_vertices, new_faces = mesh.read()
-        
+
         self.vertices = new_vertices.to(self.device)
         self.faces = new_faces.to(self.device)
         

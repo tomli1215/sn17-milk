@@ -2,12 +2,17 @@ import torch
 import cumesh
 from typing import Tuple
 from geometry.mesh.schemas import MeshData
+from logger_config import logger
 
 
 def map_vertices_positions(mesh_data: MeshData, hi_res_mesh_data: MeshData, weight: float = 1.0, *, inplace: bool = False) -> MeshData:
     """Moves vertex postions to positions mapped from high resolution mesh using BVH. Iterpolates between postions"""
     bvh = hi_res_mesh_data.bvh
-    assert bvh is not None, "BVH must be built for high-res mesh"
+    if bvh is None:
+        logger.warning(
+            "map_vertices_positions skipped: high-res BVH missing (e.g. skipped after OOM)."
+        )
+        return mesh_data
     
     _, face_id, uvw = bvh.unsigned_distance(mesh_data.vertices, return_uvw=True)
     tris = hi_res_mesh_data.faces[face_id.long()]

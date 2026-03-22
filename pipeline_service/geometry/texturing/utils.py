@@ -6,6 +6,7 @@ from geometry.texturing.enums import SamplingMode
 from geometry.mesh.schemas import MeshData, AttributeGrid
 from geometry.texturing.schemas import AttributesMasked, MeshRasterizationData
 from flex_gemm.ops.grid_sample import grid_sample_3d
+from logger_config import logger
 
 
 def rasterize_mesh_data(mesh_data: MeshData, texture_size: int | Tuple[int,int], use_vertex_normals: bool = False) -> MeshRasterizationData:
@@ -71,7 +72,12 @@ def rasterize_mesh_data(mesh_data: MeshData, texture_size: int | Tuple[int,int],
 def map_mesh_rasterization(rast_data: MeshRasterizationData, mesh_data: MeshData, flip_vertex_normals: bool = False) -> MeshRasterizationData:
 
     bvh = mesh_data.bvh
-    assert bvh is not None, "Mesh BVH needs to be build for mapping"
+    if bvh is None:
+        logger.warning(
+            "map_mesh_rasterization: BVH missing (e.g. skipped after OOM); "
+            "using raster positions without high-res surface projection."
+        )
+        return rast_data
     valid_pos = rast_data.positions
 
     # Map these positions back to the *original* high-res mesh to get accurate attributes

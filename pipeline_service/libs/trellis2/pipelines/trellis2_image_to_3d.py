@@ -453,15 +453,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
         out_mesh = []
         for m, v in zip(meshes, tex_voxels):
-            try:
-                m.fill_holes()
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    import warnings
-                    warnings.warn(f"fill_holes skipped due to CUDA OOM ({m.faces.shape[0]} faces)")
-                    torch.cuda.empty_cache()
-                else:
-                    raise
+            m.fill_holes()
             out_mesh.append(
                 MeshWithVoxel(
                     m.vertices, m.faces,
