@@ -1,47 +1,44 @@
 from __future__ import annotations
 
 import time
-from typing import Iterable
 
-import numpy as np
+from modules.background_removal.params import BackgroundRemovalParams
 import torch
-from PIL import Image
-from torchvision.transforms.functional import crop, resized_crop, to_pil_image
+from torchvision.transforms.functional import crop, resize, resized_crop
 
 from logger_config import logger
+from schemas.types import ImageCHWTensor, ImageSize, ImageTensor
+from modules.background_removal.schemas import BackgroundRemovalInput, BackgroundRemovalOutput
 
 from .background_removal_pipeline import BackgroundRemovalPipeline
-from .settings import BackgroundRemovalConfig
 
 
 class BackgroundRemovalModule:
     """Shared image post-processing for background removal outputs."""
 
-    def __init__(self, settings: BackgroundRemovalConfig):
-        self.padding_percentage = settings.padding_percentage
-        self.limit_padding = settings.limit_padding
-        self.output_size = settings.output_image_size
+    def __init__(self, params: BackgroundRemovalParams):
+        self.default_params = params
 
-    def remove_background(
-        self,
-        pipeline: BackgroundRemovalPipeline,
-        image: Image.Image | Iterable[Image.Image],
-    ) -> Image.Image | tuple[Image.Image, ...]:
-        pipeline.ensure_ready()
+    def remove_background(self, request: BackgroundRemovalInput) -> BackgroundRemovalOutput:
+        model: BackgroundRemovalPipeline = request.model
         start_time = time.time()
 
-        is_single = isinstance(image, Image.Image)
-        images = [image] if is_single else list(image)
-        outputs: list[Image.Image] = []
+        params: BackgroundRemovalParams = self.default_params.overrided(request.params)
 
-        for img in images:
-            if self._has_nonopaque_alpha(img):
-                outputs.append(img.convert("RGB"))
+        images = list(request.images)
+        outputs: list[ImageTensor] = []
+
+        for image in images:
+            if self._has_nonopaque_alpha(image):
+                outputs.append(image[..., :3].contiguous())
                 continue
 
-            tensor_rgb, mask = pipeline.predict_rgb_and_mask(img)
-            cropped_rgba = self._crop_and_center(tensor_rgb, mask)
-            outputs.append(to_pil_image(cropped_rgba[:3]))
+            image_tensor = self._prepare_model_input_tensor(image, params.input_image_size)
+            tensor_rgba_batch = model.predict_rgba(image_tensor.unsqueeze(0))
+            tensor_rgba = tensor_rgba_batch[0]
+            cropped_rgba = self._crop_and_center(tensor_rgba, params=params)
+            cropped_rgb = self._blackout_background(cropped_rgba)
+            outputs.append(cropped_rgb.permute(1, 2, 0).contiguous())
 
         removal_time = time.time() - start_time
         logger.success(
@@ -49,15 +46,26 @@ class BackgroundRemovalModule:
             f"Images without background: {len(outputs)}"
         )
 
-        return outputs[0] if is_single else tuple(outputs)
+        return BackgroundRemovalOutput(images=tuple(outputs))
 
-    def _has_nonopaque_alpha(self, image: Image.Image) -> bool:
-        if image.mode != "RGBA":
+    def _has_nonopaque_alpha(self, image: ImageTensor) -> bool:
+        if image.shape[-1] != 4:
             return False
-        alpha = np.array(image)[:, :, 3]
-        return not np.all(alpha == 255)
+        alpha = image[..., 3]
+        return not torch.all(alpha >= 1.0 - (1.0 / 255.0)).item()
 
-    def _crop_and_center(self, tensor_rgb: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _prepare_model_input_tensor(image: ImageTensor, input_size: ImageSize) -> ImageTensor:
+
+        image_rgb = image[..., :3].broadcast_to(*image.shape[:-1], 3)
+
+        image_chw = image_rgb.permute(2, 0, 1)
+        image_chw = resize(image_chw, size=input_size, antialias=False)
+        return image_chw.permute(1, 2, 0).contiguous()
+
+    def _crop_and_center(self, tensor_rgba: ImageCHWTensor, params: BackgroundRemovalParams) -> ImageCHWTensor:
+        mask = tensor_rgba[3]
+
         bbox_indices = torch.argwhere(mask > 0.8)
         if len(bbox_indices) == 0:
             crop_args = dict(top=0, left=0, height=mask.shape[1], width=mask.shape[0])
@@ -67,7 +75,7 @@ class BackgroundRemovalModule:
             width, height = w_max - w_min, h_max - h_min
             center = (h_max + h_min) / 2, (w_max + w_min) / 2
             size = max(width, height)
-            padded_size_factor = 1 + self.padding_percentage
+            padded_size_factor = 1 + params.padding_percentage
             size = max(int(size * padded_size_factor), 2)
 
             top = int(center[1] - size // 2)
@@ -75,7 +83,7 @@ class BackgroundRemovalModule:
             bottom = int(center[1] + size // 2)
             right = int(center[0] + size // 2)
 
-            if self.limit_padding:
+            if params.limit_padding:
                 top = max(0, top)
                 left = max(0, left)
                 bottom = min(mask.shape[1], bottom)
@@ -88,8 +96,11 @@ class BackgroundRemovalModule:
                 width=right - left,
             )
 
-        mask = mask.unsqueeze(0)
-        tensor_rgba = torch.cat([tensor_rgb * mask, mask], dim=-3)
-        if self.output_size:
-            return resized_crop(tensor_rgba, **crop_args, size=self.output_size, antialias=False)
+        if params.output_image_size is not None:
+            return resized_crop(tensor_rgba, **crop_args, size=params.output_image_size, antialias=False)
         return crop(tensor_rgba, **crop_args)
+
+    def _blackout_background(self, tensor_rgba: ImageCHWTensor) -> ImageCHWTensor:
+        mask = tensor_rgba[3]
+        mask_3ch = mask.unsqueeze(-3)
+        return tensor_rgba[:3] * mask_3ch

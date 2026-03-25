@@ -37,7 +37,7 @@ def _detect_cpu_limit() -> None:
         cpu_count = os.cpu_count() or 1
 
     # Cap threads for xatlas stability
-    max_xatlas_threads = 16
+    max_xatlas_threads = 13
     if cpu_count > max_xatlas_threads:
         print(f"XATLAS_NUM_THREADS: capping from {cpu_count} to {max_xatlas_threads} for stability")
         cpu_count = max_xatlas_threads

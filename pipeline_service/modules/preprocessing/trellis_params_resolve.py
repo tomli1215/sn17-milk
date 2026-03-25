@@ -22,20 +22,15 @@ async def resolve_trellis_params_after_rmbg(
     judge_cfg: JudgeConfig,
     *,
     trellis_params_override: Optional[TrellisParams.Overrides],
-    trellis_run_overrides: Optional[dict],
     rmbg_preview_image: Image.Image,
     seed: int,
 ) -> TrellisParams.Overrides:
     """
-    Decide effective ``pipeline_type`` (YAML explicit / VLM / default), apply
+    Decide effective ``pipeline_type`` (request override / VLM / default), apply
     ``trellis_cfg.pipeline_profiles``, then merge ``trellis_params_override``.
     When VLM picks the pipeline, any ``pipeline_type`` in overrides is ignored.
     """
-    tro = trellis_run_overrides or {}
     route_vllm = trellis_cfg.pipeline_route_via_vllm
-    if tro.get("pipeline_route_via_vllm") is not None:
-        route_vllm = bool(tro["pipeline_route_via_vllm"])
-    explicit_pt = bool(tro.get("explicit_pipeline_type"))
 
     def _effective_from_overrides() -> TrellisPipeType:
         if trellis_params_override is not None and trellis_params_override.pipeline_type is not None:
@@ -43,9 +38,7 @@ async def resolve_trellis_params_after_rmbg(
         return trellis_cfg.pipeline_type
 
     vllm_chose = False
-    if explicit_pt:
-        effective_pt = trellis_params_override.pipeline_type  # type: ignore[union-attr]
-    elif route_vllm:
+    if route_vllm:
         base_url = trellis_cfg.pipeline_route_vllm_url or judge_cfg.vllm_url
         model = trellis_cfg.pipeline_route_vllm_model or judge_cfg.vllm_model_name
         api_key = trellis_cfg.pipeline_route_vllm_api_key or judge_cfg.vllm_api_key

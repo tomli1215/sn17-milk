@@ -4,10 +4,10 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 import torch
-from PIL import Image
 
 from config.settings import ModelVersionsConfig
 from logger_config import logger
+from schemas.types import ImageTensor, ImagesCHWTensor, ImagesTensor
 
 from .settings import BackgroundRemovalConfig
 
@@ -42,16 +42,12 @@ class BackgroundRemovalPipeline(ABC):
     def is_ready(self) -> bool:
         return self.model is not None
 
-    def ensure_ready(self) -> None:
-        if self.model is None:
-            raise RuntimeError(f"{self.settings.model_id} model not initialized.")
-
     @abstractmethod
     def _load_model(self) -> Any:
         """Load and return model instance."""
         raise NotImplementedError
 
     @abstractmethod
-    def predict_rgb_and_mask(self, image: Image.Image) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return RGB tensor and foreground mask for a single image."""
+    def predict_rgba(self, image: ImageTensor | ImagesTensor) -> ImagesCHWTensor:
+        """Return batched CHW RGBA tensors."""
         raise NotImplementedError

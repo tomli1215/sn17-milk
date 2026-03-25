@@ -45,7 +45,10 @@ class TrellisParams(OverridableModel):
         if not prof and pt.value in ("1024_cascade", "1536_cascade"):
             prof = settings.pipeline_profiles.get("1024")
         if prof:
-            for k, v in prof.model_dump(exclude_none=True).items():
+            prof_dump = prof.model_dump(exclude_none=True)
+            # num_candidates lives only on TrellisPipelineProfile for pipeline.py resolution, not on TrellisParams.
+            prof_dump.pop("num_candidates", None)
+            for k, v in prof_dump.items():
                 data[k] = v
         return cls(**data)
 

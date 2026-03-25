@@ -87,22 +87,30 @@ class QwenEditModule(QwenManager):
     def _run_model_pipe(
         self,
         seed: Optional[int] = None,
+        pipe_config_override: Optional[dict] = None,
         **kwargs,
     ):
         if seed is not None:
             kwargs.update(dict(generator=torch.Generator(device=self.device).manual_seed(seed)))
         image = kwargs.pop("image", self._empty_image)
-        result = self.pipe(image=image, **self.pipe_config, **kwargs)
+        config = pipe_config_override if pipe_config_override is not None else self.pipe_config
+        result = self.pipe(image=image, **config, **kwargs)
         return result
 
     def _run_edit_pipe(
         self,
         prompt_images: Iterable[Image.Image],
         seed: Optional[int] = None,
+        pipe_config_override: Optional[dict] = None,
         **kwargs,
     ):
         prompt_images = list(self._prepare_input_image(prompt_image) for prompt_image in prompt_images)
-        return self._run_model_pipe(seed=seed, image=prompt_images, **kwargs)
+        return self._run_model_pipe(
+            seed=seed,
+            image=prompt_images,
+            pipe_config_override=pipe_config_override,
+            **kwargs,
+        )
     
     
     def edit_image(
@@ -110,13 +118,15 @@ class QwenEditModule(QwenManager):
         prompt_image: Image.Image | Iterable[Image.Image],
         seed: int,
         prompting: Prompting | str,
+        pipe_overrides: Optional[dict] = None,
     ):
-        """
+        """ 
         Edit the image using Qwen Edit.
 
         Args:
             prompt_image: The prompt image to edit.
             prompting: Prompting object or string prompt.
+            pipe_overrides: Optional per-call overrides for pipe config (e.g. num_inference_steps, true_cfg_scale).
 
         Returns:
             The edited image.
@@ -124,7 +134,7 @@ class QwenEditModule(QwenManager):
         if self.pipe is None:
             logger.error("Edit Model is not loaded")
             raise RuntimeError("Edit Model is not loaded")
-
+        
         try:
             start_time = time.time()
 
@@ -136,11 +146,20 @@ class QwenEditModule(QwenManager):
 
             prompting_args = prompting.model_dump()
 
+            # Merge per-call pipe overrides with default pipe_config
+            pipe_config = dict(self.pipe_config)
+            if pipe_overrides:
+                allowed = {"num_inference_steps", "true_cfg_scale", "height", "width"}
+                for k in allowed:
+                    if k in pipe_overrides and pipe_overrides[k] is not None:
+                        pipe_config[k] = pipe_overrides[k]
+
             # Run the edit pipe
             result = self._run_edit_pipe(
                 prompt_images=prompt_images,
                 **prompting_args,
                 seed=seed,
+                pipe_config_override=pipe_config,
             )
             
             generation_time = time.time() - start_time

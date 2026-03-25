@@ -19,16 +19,18 @@ output:
 trellis:
   model_id: "microsoft/TRELLIS.2-4B"
   # Defaults when a pipeline_profiles entry omits a field:
-  sparse_structure_steps: 16
-  sparse_structure_cfg_strength: 6.0
-  shape_slat_steps: 8
-  shape_slat_cfg_strength: 3.0
-  tex_slat_steps: 12
-  tex_slat_cfg_strength: 6.0
-  # Sampler overrides per pipeline_type (keys: "512", "1024", "1024_cascade", "1536_cascade").
+  # sparse_structure_steps: 16
+  # sparse_structure_cfg_strength: 6.0
+  # shape_slat_steps: 8
+  # shape_slat_cfg_strength: 3.0
+  # tex_slat_steps: 12
+  # tex_slat_cfg_strength: 9.5
+  # Overrides per pipeline_type (keys: "512", "1024", "1024_cascade", "1536_cascade"):
+  # sampler fields, optional num_candidates for that type, optional max_num_tokens.
   # Missing key uses flat fields only; 1024_cascade/1536_cascade fall back to "1024" profile if present.
   pipeline_profiles:
     "512":
+      num_candidates: 3
       sparse_structure_steps: 16
       sparse_structure_cfg_strength: 6.0
       shape_slat_steps: 12
@@ -36,16 +38,18 @@ trellis:
       tex_slat_steps: 20
       tex_slat_cfg_strength: 5.0
     "1024_cascade":
+      num_candidates: 2
       sparse_structure_steps: 16
       sparse_structure_cfg_strength: 6.0
       shape_slat_steps: 8
       shape_slat_cfg_strength: 3.0
       tex_slat_steps: 12
-      tex_slat_cfg_strength: 6.0
-  pipeline_type: "1024_cascade"  # default before VLM routing
+      tex_slat_cfg_strength: 9.5
+  pipeline_type: "1024_cascade"  # default before VLM routing when pipeline_route_via_vllm is on
   mode: "stochastic"  # "stochastic", "multidiffusion"
   multiview: false
-  num_candidates: 3
+  # Default num_candidates when a pipeline_profiles entry does not set num_candidates (e.g. "1024"-only profile).
+  num_candidates: 2
   # If > 0 and time from pipeline start to end of Trellis texturing exceeds this (seconds),
   # only the first 2 mesh candidates are converted to GLB (and sent to judge); otherwise use num_candidates.
   texturing_time_limit_seconds: 40
@@ -74,13 +78,15 @@ qwen:
   dtype: "bf16"
   
 
-# Background removal model settings
+# Background removal model settings (model_type: ben2 | birefnet — must match model_id family)
 background_removal:
   model_id: "ZhengPeng7/BiRefNet"
-  input_image_size: [1024, 1024]
-  padding_percentage: 0.05
-  limit_padding: false
+  model_type: birefnet
   gpu: 0
+  params:
+    input_image_size: [1024, 1024]
+    padding_percentage: 0.05
+    limit_padding: false
 
 # GLB Converter settings (v1.0 implementation)
 glb_converter:
@@ -109,6 +115,9 @@ judge:
   vllm_api_key: "local"
   vllm_model_name: "THUDM/GLM-4.1V-9B-Thinking"
   enabled: true
+  # Qwen: generate multiple edits (seeds base, base+1, …) and pick best identity match via vLLM (v1.2 parity).
+  qwen_edit_candidate_count: 3
+  pick_best_qwen_edit_via_vllm: true
 
 # Model versions (pinned HuggingFace model revisions)
 model_versions:

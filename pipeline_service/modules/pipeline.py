@@ -24,15 +24,19 @@ from schemas.responses import GenerationResponse
 from modules.mesh_generator.schemas import TrellisParams, TrellisRequest, TrellisResult
 from modules.mesh_generator.enums import TrellisPipeType
 from modules.image_edit.qwen_edit_module import QwenEditModule
-from modules.background_removal.ben2_module import BEN2BackgroundRemovalService
-from modules.background_removal.birefnet_module import BirefNetBackgroundRemovalService
+from modules.background_removal.ben2_pipeline import BEN2BackgroundRemovalPipeline
+from modules.background_removal.birefnet_pipeline import BirefNetBackgroundRemovalPipeline
+from modules.background_removal.background_removal_module import BackgroundRemovalModule
+from modules.background_removal.schemas import BackgroundRemovalInput
+from modules.background_removal.enums import RMBGModelType
 from modules.grid_renderer.render import GridViewRenderer
 from modules.mesh_generator.trellis_manager import TrellisService
 from modules.converters.glb_converter import GLBConverter
 from libs.trellis2.representations.mesh.base import MeshWithVoxel
 from modules.judge.duel_manager import DuelManager
 from modules.preprocessing.trellis_params_resolve import resolve_trellis_params_after_rmbg
-from modules.utils import image_grid, secure_randint, set_random_seed, decode_image, to_png_base64, save_files
+from modules.utils import image_grid, secure_randint, set_random_seed, decode_image, to_png_base64, save_files, compute_image_hash
+from schemas.image_convertions import pil_images_to_images_tensor, image_tensor_to_pil
 
 
 class GenerationPipeline:
@@ -47,13 +51,13 @@ class GenerationPipeline:
         # Initialize modules
         self.qwen_edit = QwenEditModule(settings.qwen, settings.model_versions)
 
-        # Initialize background removal module
-        if self.settings.background_removal.model_id == "PramaLLC/BEN2":
-            self.rmbg = BEN2BackgroundRemovalService(settings.background_removal, settings.model_versions)
-        elif self.settings.background_removal.model_id == "ZhengPeng7/BiRefNet_dynamic":
-            self.rmbg = BirefNetBackgroundRemovalService(settings.background_removal, settings.model_versions)
-        elif self.settings.background_removal.model_id == "ZhengPeng7/BiRefNet":
-            self.rmbg = BirefNetBackgroundRemovalService(settings.background_removal, settings.model_versions)
+        self.rmbg_module = BackgroundRemovalModule(settings.background_removal.params)
+
+        model_type = self.settings.background_removal.model_type
+        if model_type == RMBGModelType.BEN2:
+            self.rmbg_pipeline = BEN2BackgroundRemovalPipeline(settings.background_removal, settings.model_versions)
+        elif model_type == RMBGModelType.BIREFNET:
+            self.rmbg_pipeline = BirefNetBackgroundRemovalPipeline(settings.background_removal, settings.model_versions)
         else:
             raise ValueError(f"Unsupported background removal model: {self.settings.background_removal.model_id}")
 
@@ -71,9 +75,8 @@ class GenerationPipeline:
         """Initialize all pipeline components."""
         logger.info("Starting pipeline")
         self.settings.output.output_dir.mkdir(parents=True, exist_ok=True)
-
         await self.qwen_edit.startup()
-        await self.rmbg.startup()
+        await self.rmbg_pipeline.startup()
         await self.trellis.startup()
         
         logger.info("Warming up generator...")
@@ -88,7 +91,7 @@ class GenerationPipeline:
 
         # Shutdown all modules
         await self.qwen_edit.shutdown()
-        await self.rmbg.shutdown()
+        await self.rmbg_pipeline.shutdown()
         await self.trellis.shutdown()
 
         logger.info("Pipeline closed.")
@@ -189,7 +192,11 @@ class GenerationPipeline:
         return dynamic
     
         
-    def _edit_images(self, image: Image.Image, seed: int) -> list[Image.Image]:
+    def _edit_images(
+        self,
+        image: Image.Image,
+        seed: int,
+    ) -> list[Image.Image]:
         """
         Edit image based on current mode (multiview or base).
 
@@ -230,6 +237,56 @@ class GenerationPipeline:
             prompting=base_prompt,
         )
 
+    def _use_qwen_edit_vllm_picker(self) -> bool:
+        """Match v1.2: when judge is on, optionally generate multiple Qwen seeds and pick best via vLLM."""
+        j = self.settings.judge
+        return bool(
+            self.duel_manager
+            and j.pick_best_qwen_edit_via_vllm
+            and j.qwen_edit_candidate_count >= 2
+        )
+
+    async def _edit_images_with_judge(
+        self,
+        image: Image.Image,
+        seed: int,
+    ) -> list[Image.Image]:
+        """
+        Generate ``qwen_edit_candidate_count`` full Qwen runs with seeds ``seed``, ``seed+1``, …
+        then call vLLM to pick the candidate whose first output image best preserves identity
+        (same tournament as origin/v1.2 ``judge_edited_images``).
+        """
+        n = self.settings.judge.qwen_edit_candidate_count
+        seeds = [seed + i for i in range(n)]
+        logger.info(f"Generating {n} Qwen edit candidates with seeds {seeds} for vLLM identity judging")
+
+        candidates: list[list[Image.Image]] = []
+        for s in seeds:
+            set_random_seed(s)
+            candidates.append(list(self._edit_images(image, s)))
+
+        paired: list[tuple[int, list[Image.Image], Image.Image]] = []
+        for idx, c in enumerate(candidates):
+            if not c:
+                continue
+            paired.append((idx, c, c[0].copy()))
+
+        if not paired:
+            return []
+        if len(paired) < 2:
+            logger.warning("Fewer than 2 non-empty Qwen candidates; skipping vLLM image judge")
+            return paired[0][1]
+
+        representatives = [p[2] for p in paired]
+        winner_sub = await self.duel_manager.judge_edited_images(
+            representatives, image, seed
+        )
+        orig_idx, chosen, _rep = paired[winner_sub]
+        logger.success(
+            f"vLLM picked Qwen candidate {winner_sub} (run_index={orig_idx}, seed={seeds[orig_idx]})"
+        )
+        return chosen
+
     async def generate_meshes(
         self,
         request: GenerationRequest,
@@ -252,16 +309,23 @@ class GenerationPipeline:
         # Decode input image
         image = decode_image(request.prompt_image)
 
-        # 1. Edit the image using Qwen Edit
-        # Qwen uses its own torch.Generator per call, but re-seed global state
-        # before each step to ensure determinism regardless of consumed RNG ops.
+        # 1. Edit the image using Qwen Edit (optional: several seeds + vLLM identity pick, like v1.2)
         set_random_seed(request.seed)
-        images_edited = list(self._edit_images(image, request.seed))
+        if self._use_qwen_edit_vllm_picker():
+            images_edited = await self._edit_images_with_judge(image, request.seed)
+        else:
+            images_edited = list(self._edit_images(image, request.seed))
 
         # 2. Remove background
         set_random_seed(request.seed)
         images_with_background = list(image.copy() for image in images_edited)
-        images_without_background = self.rmbg.remove_background(images_with_background)
+        rmbg_out = self.rmbg_module.remove_background(
+            BackgroundRemovalInput(
+                model=self.rmbg_pipeline,
+                images=pil_images_to_images_tensor(images_with_background),
+            )
+        )
+        images_without_background = [image_tensor_to_pil(t) for t in rmbg_out.images]
 
         # Trellis OOM handling:
         # - On any CUDA OOM during shape/texture, we retry exactly with:
@@ -276,12 +340,16 @@ class GenerationPipeline:
                         self.settings.trellis,
                         self.settings.judge,
                         trellis_params_override=request.trellis_params,
-                        trellis_run_overrides=None,
                         rmbg_preview_image=images_without_background[0],
                         seed=request.seed,
                     )
 
-                    num_candidates = self.settings.trellis.num_candidates
+                    num_candidates = self.settings.trellis.num_candidates_for_pipeline_type(
+                        trellis_params.pipeline_type
+                    )
+                    logger.info(
+                        f"Trellis num_candidates={num_candidates} (pipeline_type={trellis_params.pipeline_type.value})"
+                    )
                     texture_candidates = num_candidates
                 else:
                     # Forced safer retry
@@ -404,10 +472,19 @@ class GenerationPipeline:
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         image = decode_image(image_b64)
         set_random_seed(seed)
-        images_edited = list(self._edit_images(image, seed))
+        if self._use_qwen_edit_vllm_picker():
+            images_edited = await self._edit_images_with_judge(image, seed)
+        else:
+            images_edited = list(self._edit_images(image, seed))
         set_random_seed(seed)
         images_with_background = list(img.copy() for img in images_edited)
-        images_without_background = self.rmbg.remove_background(images_with_background)
+        rmbg_out = self.rmbg_module.remove_background(
+            BackgroundRemovalInput(
+                model=self.rmbg_pipeline,
+                images=pil_images_to_images_tensor(images_with_background),
+            )
+        )
+        images_without_background = [image_tensor_to_pil(t) for t in rmbg_out.images]
         edited_grid = image_grid(images_edited)
         no_bg_grid = image_grid(images_without_background)
         return {
@@ -429,10 +506,15 @@ class GenerationPipeline:
             GenerateResponse with generated assets (first candidate GLB + all candidate renders)
         """
         t1 = time.time()
+        try:
+            image_bytes = base64.b64decode(request.prompt_image)
+        except Exception:
+            image_bytes = b""
+        image_hash = compute_image_hash(image_bytes)
+        logger.info(f"Image hash for this request: {image_hash[:16]}...")
 
         logger.info(f"Request received | Seed: {request.seed} | Prompt Type: {request.prompt_type.value}")
 
-        # Generate meshes (batch) and get processed images
         meshes, images_edited, images_without_background = await self.generate_meshes(request)
 
         # Timeline: if texturing finished after the limit, use only 2 candidates for GLB conversion
@@ -442,7 +524,7 @@ class GenerationPipeline:
             num_glb_candidates = min(2, len(meshes))
             logger.warning(
                 f"Texturing took {elapsed_till_texturing:.0f}s (limit {limit_sec}s). "
-                f"Using {num_glb_candidates} candidates for GLB conversion (config num_candidates={self.settings.trellis.num_candidates})."
+                f"Using {num_glb_candidates} candidates for GLB conversion (time-limit cap)."
             )
         else:
             num_glb_candidates = len(meshes)
@@ -514,6 +596,7 @@ class GenerationPipeline:
                     candidate_views[i],
                     candidate_views[j],
                     pair_seed,
+                    candidate_indices=(i, j),
                 )
                 # winner_idx -1 => first image (i) wins; 1 => second (j) wins
                 if winner_idx == -1:
@@ -543,6 +626,7 @@ class GenerationPipeline:
         result_json_path = output_dir / f"{safe_base}_result.json"
         try:
             result_data = {
+                "image_hash": image_hash,
                 "image_name": request.image_name or None,
                 "candidate_filenames": candidate_filenames,
                 "best_candidate_index": best_idx,

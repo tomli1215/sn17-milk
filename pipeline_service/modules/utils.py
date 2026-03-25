@@ -1,5 +1,6 @@
 from PIL import Image
 
+import hashlib
 import io
 import base64
 from datetime import datetime
@@ -39,6 +40,20 @@ def set_random_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     torch.use_deterministic_algorithms(True, warn_only=True)
+
+def compute_image_hash(image_bytes: bytes) -> str:
+    """
+    Compute a stable hash for an image from its raw bytes.
+    Same image bytes (e.g. same file) always yield the same hash for config lookup.
+
+    Args:
+        image_bytes: Raw image bytes (e.g. decoded from base64 or file read).
+
+    Returns:
+        SHA256 hex digest string.
+    """
+    return hashlib.sha256(image_bytes).hexdigest()
+
 
 def decode_image(prompt: str) -> Image.Image:
     """
